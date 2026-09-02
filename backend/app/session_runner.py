@@ -1,4 +1,5 @@
 import json
+import re
 
 from app.brightdata import WebResearchContext
 from app.models import AgentSession, RunSessionRequest, WorkspaceState
@@ -8,7 +9,39 @@ KIMI_SYSTEM_PROMPT = """You are KimiAI inside a collaborative AI coding workspac
 You help implement code changes while respecting shared locks and active teammates.
 Use the provided workspace context. Be concise, specific, and implementation-focused.
 When web_research is provided, treat it as the source of truth for current web information and cite URLs from it.
-If you cannot safely infer a change, say what information is missing."""
+For coding requests, return a JSON object with assistant_message, files, and optional patch fields.
+The files field must be an object mapping safe relative paths to complete file contents.
+For non-coding requests, files may be an empty object.
+Do not wrap the JSON in Markdown fences.
+If you cannot safely infer a change, explain what information is missing in assistant_message."""
+
+
+def parse_model_result(raw_result: str) -> tuple[str, dict[str, str], str | None]:
+    """Parse structured agent output while preserving compatibility with plain-text providers."""
+    candidate = raw_result.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1)
+
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return raw_result, {}, None
+
+    if not isinstance(payload, dict):
+        return raw_result, {}, None
+
+    message = payload.get("assistant_message") or payload.get("explanation") or payload.get("message")
+    files_payload = payload.get("files", {})
+    files = {}
+    if isinstance(files_payload, dict):
+        files = {
+            path: content
+            for path, content in files_payload.items()
+            if isinstance(path, str) and isinstance(content, str)
+        }
+    patch = payload.get("patch")
+    return str(message or "Session completed."), files, str(patch) if patch is not None else None
 
 
 def build_model_messages(

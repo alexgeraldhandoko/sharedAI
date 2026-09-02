@@ -13,10 +13,11 @@ The MVP implements:
 - Bright Data web research context for current-information prompts
 - model session execution for coding/general sessions
 - session completion and lock release
+- shared generated-file persistence
 - workspace state inspection
-- WebSocket update channel
+- WebSocket updates and live participant presence
 
-Runtime state is Redis-backed by default. Redis stores workspaces, active lock leases, agent sessions, and recent action events. The in-memory store still exists for tests and quick local experiments through `AI_WORKSPACE_STORE=memory`.
+Runtime state is Redis-backed by default. Redis stores workspaces, active lock leases, agent sessions, generated files, and recent action events. The in-memory store still exists for tests and quick local experiments through `AI_WORKSPACE_STORE=memory`.
 
 Model calls are OpenAI-compatible. TokenRouter is the preferred gateway when configured:
 
@@ -145,4 +146,4 @@ curl -X POST http://127.0.0.1:8000/workspaces/<workspace_id>/sessions/<session_i
   }'
 ```
 
-The `/run` endpoint optionally runs Bright Data first, then sends the member prompt, selected model, active lock map, current session, recent workspace events, and web research evidence to the configured model gateway. The model output is stored as the session result, and the session's locks are released.
+The `/run` endpoint optionally runs Bright Data first, then sends the member prompt, selected model, active lock map, current session, recent workspace events, and web research evidence to the configured model gateway. Structured model output is parsed into an assistant message and complete file contents, persisted in shared workspace state, and broadcast to connected clients before the session's locks are released.

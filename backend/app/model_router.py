@@ -32,7 +32,7 @@ def route_model(task_type: TaskType, prompt: str) -> ModelRoute:
     normalized_prompt = prompt.lower()
     gateway = configured_gateway_name()
 
-    if task_type == TaskType.ml or "train" in normalized_prompt:
+    if task_type == TaskType.ml:
         return ModelRoute(
             gateway=gateway,
             provider="Nosana",
@@ -40,7 +40,7 @@ def route_model(task_type: TaskType, prompt: str) -> ModelRoute:
             reason="GPU-backed route for model training or heavy ML workloads.",
         )
 
-    if task_type == TaskType.image or "image" in normalized_prompt:
+    if task_type == TaskType.image:
         return ModelRoute(
             gateway=gateway,
             provider="SenseNova",

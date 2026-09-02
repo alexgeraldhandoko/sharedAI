@@ -1,8 +1,10 @@
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from redis.exceptions import RedisError
 
@@ -24,7 +26,7 @@ from app.models import (
     WorkspaceResponse,
     WorkspaceState,
 )
-from app.session_runner import build_model_messages
+from app.session_runner import build_model_messages, parse_model_result
 from app.settings import (
     build_fallback_model_client_from_env,
     build_model_client_from_env,
@@ -38,13 +40,24 @@ from app.tokenrouter import TokenRouterAPIError, TokenRouterConfigurationError
 class WebSocketHub:
     def __init__(self) -> None:
         self._connections: dict[str, set[WebSocket]] = {}
+        self._members: dict[str, dict[str, int]] = {}
 
-    async def connect(self, workspace_id: str, websocket: WebSocket) -> None:
+    async def connect(self, workspace_id: str, websocket: WebSocket, member_id: str) -> None:
         await websocket.accept()
         self._connections.setdefault(workspace_id, set()).add(websocket)
+        members = self._members.setdefault(workspace_id, {})
+        members[member_id] = members.get(member_id, 0) + 1
 
-    def disconnect(self, workspace_id: str, websocket: WebSocket) -> None:
+    def disconnect(self, workspace_id: str, websocket: WebSocket, member_id: str) -> None:
         self._connections.get(workspace_id, set()).discard(websocket)
+        members = self._members.get(workspace_id, {})
+        if member_id in members:
+            members[member_id] -= 1
+            if members[member_id] <= 0:
+                members.pop(member_id, None)
+
+    def members(self, workspace_id: str) -> list[str]:
+        return sorted(self._members.get(workspace_id, {}))
 
     async def broadcast(self, workspace_id: str, payload: dict) -> None:
         stale_connections: list[WebSocket] = []
@@ -55,7 +68,7 @@ class WebSocketHub:
                 stale_connections.append(websocket)
 
         for websocket in stale_connections:
-            self.disconnect(workspace_id, websocket)
+            self._connections.get(workspace_id, set()).discard(websocket)
 
 
 def create_app(
@@ -79,6 +92,17 @@ def create_app(
             await store.close()
 
     app = FastAPI(title="AI Workspace Backend", version="0.1.0", lifespan=lifespan)
+    configured_origins = os.getenv(
+        "CORS_ORIGINS",
+        "http://127.0.0.1:3000,http://localhost:3000,http://127.0.0.1:5173,http://localhost:5173",
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[origin.strip() for origin in configured_origins.split(",") if origin.strip()],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     async def run_with_model_fallback(
         messages: list[dict[str, str]],
@@ -238,17 +262,18 @@ def create_app(
                 raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
         messages = build_model_messages(session, state, request, web_research=web_research)
-        result = await run_with_model_fallback(
+        raw_result = await run_with_model_fallback(
             messages=messages,
             model=session.route.model,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
         )
+        result_summary, files, patch = parse_model_result(raw_result)
 
         completed = await store.complete_session(
             workspace_id,
             session_id,
-            CompleteSessionRequest(result_summary=result),
+            CompleteSessionRequest(result_summary=result_summary, patch=patch, files=files),
         )
         if completed is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace or session not found.")
@@ -264,19 +289,40 @@ def create_app(
         return events
 
     @app.websocket("/workspaces/{workspace_id}/ws")
-    async def workspace_websocket(workspace_id: str, websocket: WebSocket) -> None:
+    async def workspace_websocket(
+        workspace_id: str,
+        websocket: WebSocket,
+        member_id: str = "Member",
+    ) -> None:
         workspace = await store.get_workspace(workspace_id)
         if workspace is None:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
-        await hub.connect(workspace_id, websocket)
+        clean_member_id = member_id.strip() or "Member"
+        await hub.connect(workspace_id, websocket, clean_member_id)
         try:
-            await websocket.send_json({"type": "connected", "workspace_id": workspace_id})
+            await websocket.send_json(
+                {
+                    "type": "connected",
+                    "workspace_id": workspace_id,
+                    "members": hub.members(workspace_id),
+                }
+            )
+            await hub.broadcast(
+                workspace_id,
+                {"type": "presence.updated", "members": hub.members(workspace_id)},
+            )
             while True:
                 await websocket.receive_text()
-        except WebSocketDisconnect:
-            hub.disconnect(workspace_id, websocket)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            hub.disconnect(workspace_id, websocket, clean_member_id)
+            await hub.broadcast(
+                workspace_id,
+                {"type": "presence.updated", "members": hub.members(workspace_id)},
+            )
 
     return app
 

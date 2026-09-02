@@ -1,3 +1,6 @@
+import json
+import re
+
 import pytest
 from fastapi.testclient import TestClient
 from redis.exceptions import ConnectionError
@@ -30,6 +33,23 @@ class FakeKimiClient:
             }
         )
         return "Kimi generated a patch plan for function_login()."
+
+
+class FakeStructuredKimiClient(FakeKimiClient):
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        model: str | None = None,
+        max_tokens: int = 1200,
+        temperature: float = 1.0,
+    ) -> str:
+        await super().chat(messages, model, max_tokens, temperature)
+        return json.dumps(
+            {
+                "assistant_message": "Created the calculator module.",
+                "files": {"src/calculator.py": "def add(a, b):\n    return a + b\n"},
+            }
+        )
 
 
 class BrokenStore(InMemoryWorkspaceStore):
@@ -133,6 +153,36 @@ def create_workspace(client: TestClient) -> str:
     response = client.post("/workspaces", json={"name": "Hackathon Workspace"})
     assert response.status_code == 201
     return response.json()["id"]
+
+
+def test_workspace_uses_shareable_six_digit_code(client: TestClient) -> None:
+    workspace_id = create_workspace(client)
+
+    assert re.fullmatch(r"\d{6}", workspace_id)
+
+
+def test_local_frontend_origin_is_allowed(client: TestClient) -> None:
+    response = client.options(
+        "/workspaces",
+        headers={
+            "Origin": "http://127.0.0.1:3000",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:3000"
+
+
+def test_websocket_reports_connected_member(client: TestClient) -> None:
+    workspace_id = create_workspace(client)
+
+    with client.websocket_connect(f"/workspaces/{workspace_id}/ws?member_id=Alex") as websocket:
+        connected = websocket.receive_json()
+        presence = websocket.receive_json()
+
+    assert connected == {"type": "connected", "workspace_id": workspace_id, "members": ["Alex"]}
+    assert presence == {"type": "presence.updated", "members": ["Alex"]}
 
 
 def test_health_check(client: TestClient) -> None:
@@ -296,6 +346,28 @@ def test_running_kimi_session_calls_provider_and_completes_session(
 
     state = client.get(f"/workspaces/{workspace_id}/state").json()
     assert state["locks"] == []
+
+
+def test_structured_model_output_updates_shared_files() -> None:
+    fake_kimi = FakeStructuredKimiClient()
+    with TestClient(create_app(InMemoryWorkspaceStore(), model_client=fake_kimi)) as client:
+        workspace_id = create_workspace(client)
+        prompt = client.post(
+            f"/workspaces/{workspace_id}/prompts",
+            json={
+                "member_id": "Alex",
+                "prompt": "Create src/calculator.py",
+                "task_type": "coding",
+                "targets": [{"scope_type": "file", "scope_key": "src/calculator.py"}],
+            },
+        )
+        session_id = prompt.json()["session_id"]
+        run = client.post(f"/workspaces/{workspace_id}/sessions/{session_id}/run", json={})
+        state = client.get(f"/workspaces/{workspace_id}/state").json()
+
+    assert run.status_code == 200
+    assert run.json()["files"] == {"src/calculator.py": "def add(a, b):\n    return a + b\n"}
+    assert state["files"] == run.json()["files"]
 
 
 def test_web_prompt_uses_brightdata_context_before_model_call(

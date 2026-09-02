@@ -82,6 +82,7 @@ class AgentSession(BaseModel):
     completed_at: datetime | None = None
     result_summary: str | None = None
     patch: str | None = None
+    files: dict[str, str] = Field(default_factory=dict)
 
 
 class ActionEvent(BaseModel):
@@ -108,6 +109,7 @@ class PromptResponse(BaseModel):
 class CompleteSessionRequest(BaseModel):
     result_summary: str = "Session completed"
     patch: str | None = None
+    files: dict[str, str] = Field(default_factory=dict)
 
 
 class RunSessionRequest(BaseModel):
@@ -137,3 +139,4 @@ class WorkspaceState(BaseModel):
     locks: list[LockRecord]
     sessions: list[AgentSession]
     events: list[ActionEvent]
+    files: dict[str, str] = Field(default_factory=dict)

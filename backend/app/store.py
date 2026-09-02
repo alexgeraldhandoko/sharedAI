@@ -1,4 +1,5 @@
 import asyncio
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Protocol, TypeVar
@@ -47,6 +48,20 @@ def load_model(model_type: type[TModel], raw: str | bytes) -> TModel:
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
     return model_type.model_validate_json(raw)
+
+
+def new_workspace_code() -> str:
+    return str(secrets.randbelow(900_000) + 100_000)
+
+
+def normalize_workspace_files(files: dict[str, str]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for raw_path, content in files.items():
+        path = raw_path.strip().replace("\\", "/").lstrip("/")
+        if not path or any(part in {"", ".", ".."} for part in path.split("/")):
+            continue
+        normalized[path] = content
+    return normalized
 
 
 class WorkspaceStore(Protocol):
@@ -98,6 +113,7 @@ class InMemoryWorkspaceStore:
         self._locks: dict[str, dict[str, LockRecord]] = {}
         self._sessions: dict[str, dict[str, AgentSession]] = {}
         self._events: dict[str, list[ActionEvent]] = {}
+        self._files: dict[str, dict[str, str]] = {}
 
     async def ping(self) -> bool:
         return True
@@ -107,11 +123,15 @@ class InMemoryWorkspaceStore:
 
     async def create_workspace(self, request: WorkspaceCreate) -> WorkspaceResponse:
         async with self._lock:
-            workspace = WorkspaceResponse(id=str(uuid4()), name=request.name, created_at=now_utc())
+            workspace_id = new_workspace_code()
+            while workspace_id in self._workspaces:
+                workspace_id = new_workspace_code()
+            workspace = WorkspaceResponse(id=workspace_id, name=request.name, created_at=now_utc())
             self._workspaces[workspace.id] = workspace
             self._locks[workspace.id] = {}
             self._sessions[workspace.id] = {}
             self._events[workspace.id] = []
+            self._files[workspace.id] = {}
             self._append_event(
                 workspace.id,
                 event_type="workspace.created",
@@ -134,6 +154,7 @@ class InMemoryWorkspaceStore:
                 locks=list(self._locks[workspace_id].values()),
                 sessions=list(self._sessions[workspace_id].values()),
                 events=self._events[workspace_id][-100:],
+                files=dict(self._files[workspace_id]),
             )
 
     async def get_session(self, workspace_id: str, session_id: str) -> AgentSession | None:
@@ -228,6 +249,8 @@ class InMemoryWorkspaceStore:
             session.completed_at = now_utc()
             session.result_summary = request.result_summary
             session.patch = request.patch
+            session.files = normalize_workspace_files(request.files)
+            self._files[workspace_id].update(session.files)
 
             for target in session.targets:
                 self._release_target(workspace_id, target)
@@ -350,8 +373,15 @@ class RedisWorkspaceStore:
         await self._redis.aclose()
 
     async def create_workspace(self, request: WorkspaceCreate) -> WorkspaceResponse:
-        workspace = WorkspaceResponse(id=str(uuid4()), name=request.name, created_at=now_utc())
-        await self._redis.set(self._workspace_key(workspace.id), dump_model(workspace))
+        workspace: WorkspaceResponse | None = None
+        for _ in range(100):
+            candidate = WorkspaceResponse(id=new_workspace_code(), name=request.name, created_at=now_utc())
+            created = await self._redis.set(self._workspace_key(candidate.id), dump_model(candidate), nx=True)
+            if created:
+                workspace = candidate
+                break
+        if workspace is None:
+            raise RuntimeError("Unable to allocate a unique workspace code.")
         await self._redis.sadd(self._workspaces_key(), workspace.id)
         await self._append_event(
             workspace.id,
@@ -376,6 +406,7 @@ class RedisWorkspaceStore:
             locks=await self._active_locks(workspace_id),
             sessions=await self._list_sessions(workspace_id),
             events=await self._list_events(workspace_id),
+            files=await self._list_files(workspace_id),
         )
 
     async def get_session(self, workspace_id: str, session_id: str) -> AgentSession | None:
@@ -483,7 +514,10 @@ class RedisWorkspaceStore:
             session.completed_at = now_utc()
             session.result_summary = request.result_summary
             session.patch = request.patch
+            session.files = normalize_workspace_files(request.files)
             await self._redis.hset(self._sessions_key(workspace_id), session.id, dump_model(session))
+            if session.files:
+                await self._redis.hset(self._files_key(workspace_id), mapping=session.files)
 
             for target in session.targets:
                 await self._release_target(workspace_id, target)
@@ -588,6 +622,10 @@ class RedisWorkspaceStore:
         raw_events = await self._redis.lrange(self._events_key(workspace_id), -100, -1)
         return [load_model(ActionEvent, raw_event) for raw_event in raw_events]
 
+    async def _list_files(self, workspace_id: str) -> dict[str, str]:
+        files = await self._redis.hgetall(self._files_key(workspace_id))
+        return {str(path): str(content) for path, content in files.items()}
+
     async def _append_event(
         self,
         workspace_id: str,
@@ -643,6 +681,9 @@ class RedisWorkspaceStore:
 
     def _events_key(self, workspace_id: str) -> str:
         return self._key("workspace", workspace_id, "events")
+
+    def _files_key(self, workspace_id: str) -> str:
+        return self._key("workspace", workspace_id, "files")
 
     def _lock_index_key(self, workspace_id: str) -> str:
         return self._key("workspace", workspace_id, "lock-index")
