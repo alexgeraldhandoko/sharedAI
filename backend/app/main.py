@@ -40,21 +40,32 @@ from app.tokenrouter import TokenRouterAPIError, TokenRouterConfigurationError
 class WebSocketHub:
     def __init__(self) -> None:
         self._connections: dict[str, set[WebSocket]] = {}
+        self._connection_members: dict[WebSocket, str] = {}
         self._members: dict[str, dict[str, int]] = {}
 
     async def connect(self, workspace_id: str, websocket: WebSocket, member_id: str) -> None:
         await websocket.accept()
         self._connections.setdefault(workspace_id, set()).add(websocket)
+        self._connection_members[websocket] = member_id
         members = self._members.setdefault(workspace_id, {})
         members[member_id] = members.get(member_id, 0) + 1
 
     def disconnect(self, workspace_id: str, websocket: WebSocket, member_id: str) -> None:
-        self._connections.get(workspace_id, set()).discard(websocket)
+        connections = self._connections.get(workspace_id, set())
+        if websocket not in connections:
+            return
+
+        connections.discard(websocket)
+        registered_member = self._connection_members.pop(websocket, member_id)
         members = self._members.get(workspace_id, {})
-        if member_id in members:
-            members[member_id] -= 1
-            if members[member_id] <= 0:
-                members.pop(member_id, None)
+        if registered_member in members:
+            members[registered_member] -= 1
+            if members[registered_member] <= 0:
+                members.pop(registered_member, None)
+        if not connections:
+            self._connections.pop(workspace_id, None)
+        if not members:
+            self._members.pop(workspace_id, None)
 
     def members(self, workspace_id: str) -> list[str]:
         return sorted(self._members.get(workspace_id, {}))
@@ -64,11 +75,12 @@ class WebSocketHub:
         for websocket in self._connections.get(workspace_id, set()):
             try:
                 await websocket.send_json(payload)
-            except RuntimeError:
+            except (RuntimeError, WebSocketDisconnect):
                 stale_connections.append(websocket)
 
         for websocket in stale_connections:
-            self._connections.get(workspace_id, set()).discard(websocket)
+            member_id = self._connection_members.get(websocket, "Member")
+            self.disconnect(workspace_id, websocket, member_id)
 
 
 def create_app(
